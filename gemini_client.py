@@ -14,8 +14,7 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 _model = genai.GenerativeModel("gemini-2.0-flash")
 
-_SYSTEM_PROMPT = """
-Ты — профессиональный бизнес-аналитик, который составляет коммерческие предложения (КП).
+_SYSTEM_PROMPT = '''Ты — профессиональный бизнес-аналитик, который составляет коммерческие предложения (КП).
 Твоя задача — сгенерировать контент для КП строго в формате JSON.
 
 Верни ТОЛЬКО валидный JSON без каких-либо пояснений, markdown-блоков или дополнительного текста.
@@ -37,32 +36,19 @@ _SYSTEM_PROMPT = """
   "price_table": [
     {"item": "Название позиции", "qty": "1", "unit": "шт", "price": "500 000,00", "total": "6 000 000,00"}
   ]
-}"""
+}''' 
 
 
 def _extract_json(text: str) -> dict:
     """Extract JSON from model response, stripping markdown fences if present."""
     text = text.strip()
-    # Remove markdown code fences
     text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$, "", text)
+    text = re.sub(r"\s*```$", "", text)
     return json.loads(text)
 
 
 def generate_kp_content(user_request: str, history: list) -> dict:
-    """Generate KP content via Gemini API.
-
-    Args:
-        user_request: The user's request describing the KP to generate.
-        history: List of previous messages for context
-                 (each item is {"role": "user"|"model", "parts": [str]}).
-
-    Returns:
-        A dict with KP content fields.
-
-    Raises:
-        ValueError: If Gemini returns invalid JSON after retries.
-    """    
+    """Generate KP content via Gemini API."""
     messages = [{"role": "user", "parts": [_SYSTEM_PROMPT]}]
     messages.extend(history)
     messages.append({"role": "user", "parts": [user_request]})
@@ -74,7 +60,6 @@ def generate_kp_content(user_request: str, history: list) -> dict:
             raw = response.text
             logger.debug("Gemini raw response (attempt %d): %s", attempt + 1, raw)
             content = _extract_json(raw)
-            # Basic validation — ensure required keys are present
             required_keys = {
                 "kp_number", "kp_date",
                 "company_name", "contact_person", "service_title",
