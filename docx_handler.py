@@ -10,45 +10,129 @@ logger = logging.getLogger(__name__)
 
 _PLACEHOLDER_RE = re.compile(r"\{\{[\w_]+\}\}")
 
+# xml:space attribute in Clark notation
+_XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
+
 
 def _replace_text_in_run(run, replacements: dict) -> None:
     """Replace placeholder tokens inside a single run, preserving formatting."""
     for key, value in replacements.items():
         token = "{{" + key + "}}"
         if token in run.text:
-            run.text = run.text.replace(token, str(value))
+            new_text = run.text.replace(token, str(value))
+            run.text = new_text
+            wt = run._r.find(qn("w:t"))
+            if wt is not None and new_text and (
+                new_text[0] == " " or new_text[-1] == " "
+            ):
+                wt.set(_XML_SPACE, "preserve")
 
 
 def _replace_in_paragraph(paragraph, replacements: dict) -> None:
-    """Replace placeholders across all runs of a paragraph.
+    """Replace placeholders across all w:t elements of a paragraph.
 
-    Because python-docx can split a single placeholder across multiple runs,
-    we first merge the full paragraph text, detect placeholders, and then
-    rebuild runs carefully so that the *first* run in a matched sequence
-    receives the replacement text while the others are cleared.
+    Works at the XML level so that:
+    - Text inside hyperlinks, smart tags, and other wrapper elements is captured
+      (not only direct-child runs returned by ``paragraph.runs``).
+    - Placeholders split across multiple runs are handled correctly.
+    - Formatting of runs that are *not* part of a placeholder is fully preserved
+      because only the affected ``w:t`` elements are modified.
+
+    Algorithm:
+    1. Collect all ``w:t`` elements from the paragraph XML.
+    2. Build a combined string and record the start boundary of each element.
+    3. Find every ``{{key}}`` occurrence and record (start, end, value) intervals.
+    4. For each ``w:t``, compute new text by:
+       - Keeping unchanged characters verbatim.
+       - Emitting the replacement value in the *first* ``w:t`` that contains the
+         placeholder's start position; ``w:t`` elements that are entirely inside
+         the matched range but do not own the start are cleared.
+    5. Set ``xml:space="preserve"`` on any ``w:t`` whose text begins or ends with
+       a space, so Word does not silently strip leading/trailing whitespace.
     """
-    # Build a combined text with (run_index, char_index) mapping
-    full_text = "".join(run.text for run in paragraph.runs)
+    p_xml = paragraph._p
+    wt_elements = p_xml.findall(".//" + qn("w:t"))
 
-    # Fast path — nothing to replace
-    if "{{" not in full_text:
+    if not wt_elements:
         return
 
+    # Build combined text and element start-boundaries
+    texts = [wt.text or "" for wt in wt_elements]
+    combined_text = "".join(texts)
+
+    if "{{" not in combined_text:
+        return
+
+    boundaries = []
+    pos = 0
+    for t in texts:
+        boundaries.append(pos)
+        pos += len(t)
+    boundaries.append(pos)  # sentinel: total length
+
+    # Collect all replacement intervals (start, end, new_value)
+    intervals = []
     for key, value in replacements.items():
         token = "{{" + key + "}}"
-        if token not in full_text:
-            continue
+        search_start = 0
+        while True:
+            idx = combined_text.find(token, search_start)
+            if idx == -1:
+                break
+            intervals.append((idx, idx + len(token), str(value)))
+            search_start = idx + len(token)
 
-        # Rebuild run texts with the replacement applied to the full text
-        new_full = full_text.replace(token, str(value))
-        full_text = new_full  # accumulate further replacements
+    if not intervals:
+        return
 
-    # Distribute the new full text back across the runs, preserving formatting.
-    # Strategy: put all text in the first run, clear the rest.
-    if paragraph.runs:
-        paragraph.runs[0].text = full_text
-        for run in paragraph.runs[1:]:
-            run.text = ""
+    # Sort by start position and remove overlapping intervals
+    intervals.sort(key=lambda x: x[0])
+    resolved_intervals: list = []
+    last_end = -1
+    for start, end, value in intervals:
+        if start >= last_end:
+            resolved_intervals.append((start, end, value))
+            last_end = end
+
+    # Apply replacements to each w:t element independently
+    for k, wt in enumerate(wt_elements):
+        wt_start = boundaries[k]
+        wt_end = boundaries[k + 1]
+
+        if wt_start == wt_end:
+            continue  # empty element — nothing to do
+
+        element_text_parts: list = []
+        cur = wt_start  # current read position in combined_text
+
+        for rep_start, rep_end, rep_value in resolved_intervals:
+            if rep_end <= wt_start:
+                continue  # replacement is entirely before this element
+            if rep_start >= wt_end:
+                break  # replacement is entirely after this element
+
+            # Emit any unchanged text that precedes this replacement
+            if cur < rep_start:
+                element_text_parts.append(combined_text[cur:rep_start])
+
+            # Emit the replacement value only in the element that owns rep_start
+            if rep_start >= wt_start:
+                element_text_parts.append(rep_value)
+
+            cur = rep_end  # advance past the replacement
+
+        # Emit any remaining unchanged text inside this element
+        if cur < wt_end:
+            element_text_parts.append(combined_text[cur:wt_end])
+
+        new_text = "".join(element_text_parts)
+
+        if new_text != (wt.text or ""):
+            wt.text = new_text
+
+        # Preserve leading/trailing spaces (Word strips them by default)
+        if new_text and (new_text[0] == " " or new_text[-1] == " "):
+            wt.set(_XML_SPACE, "preserve")
 
 
 def _iter_paragraphs(doc: Document):
@@ -124,13 +208,19 @@ def _fill_price_table(table, price_rows: list) -> None:
             t_elements = cell_xml.findall(".//" + qn("w:t"))
             if t_elements:
                 # Clear all text elements, set first to value
-                t_elements[0].text = col_values[col_idx]
+                val = col_values[col_idx]
+                t_elements[0].text = val
+                if val and (val[0] == " " or val[-1] == " "):
+                    t_elements[0].set(_XML_SPACE, "preserve")
                 for t in t_elements[1:]:
                     t.text = ""
             elif runs:
                 # Create a w:t element in the first run
+                val = col_values[col_idx]
                 t = etree.SubElement(runs[0], qn("w:t"))
-                t.text = col_values[col_idx]
+                t.text = val
+                if val and (val[0] == " " or val[-1] == " "):
+                    t.set(_XML_SPACE, "preserve")
 
         # Insert before footer row if it exists, otherwise append
         tbl = table._tbl
